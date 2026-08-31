@@ -1,49 +1,456 @@
-name: Build RX580 D3D12 Proxy
+#define WIN32_LEAN_AND_MEAN
 
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi.h>
 
-jobs:
-  build:
-    runs-on: windows-latest
+#include <cstdio>
+#include <cstring>
+#include <cstdarg>
+#include <mutex>
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+#pragma comment(lib, "d3d12.lib")
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+using PFN_D3D12CreateDevice =
+    HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
 
-      - name: Build DLL
-        shell: cmd
-        run: |
-          cl /nologo /O2 /LD /EHsc /std:c++17 ^
-             /DWIN32_LEAN_AND_MEAN ^
-             /DUNICODE /D_UNICODE ^
-             src\main.cpp ^
-             /link ^
-             /OUT:d3d12.dll ^
-             d3d12.lib dxgi.lib
+using PFN_D3D12GetDebugInterface =
+    HRESULT(WINAPI*)(REFIID, void**);
 
-      - name: Verify DLL
-        shell: powershell
-        run: |
-          if (-not (Test-Path "d3d12.dll")) {
-            Write-Error "d3d12.dll was not created"
-            exit 1
-          }
+using PFN_D3D12GetInterface =
+    HRESULT(WINAPI*)(REFCLSID, REFIID, void**);
 
-          Get-Item d3d12.dll |
-            Select-Object Name,Length,LastWriteTime
+using PFN_D3D12CreateRootSignatureDeserializer =
+    HRESULT(WINAPI*)(
+        LPCVOID,
+        SIZE_T,
+        REFIID,
+        void**
+    );
 
-      - name: Upload DLL
-        uses: actions/upload-artifact@v4
-        with:
-          name: resonance-rx580-d3d12
-          path: d3d12.dll
-          
+using PFN_D3D12CreateVersionedRootSignatureDeserializer =
+    HRESULT(WINAPI*)(
+        LPCVOID,
+        SIZE_T,
+        REFIID,
+        void**
+    );
+
+using PFN_D3D12SerializeRootSignature =
+    HRESULT(WINAPI*)(
+        const D3D12_ROOT_SIGNATURE_DESC*,
+        D3D_ROOT_SIGNATURE_VERSION,
+        ID3DBlob**,
+        ID3DBlob**
+    );
+
+using PFN_D3D12SerializeVersionedRootSignature =
+    HRESULT(WINAPI*)(
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*,
+        ID3DBlob**,
+        ID3DBlob**
+    );
+
+static HMODULE g_realD3D12 = nullptr;
+
+static PFN_D3D12CreateDevice
+    g_D3D12CreateDevice = nullptr;
+
+static PFN_D3D12GetDebugInterface
+    g_D3D12GetDebugInterface = nullptr;
+
+static PFN_D3D12GetInterface
+    g_D3D12GetInterface = nullptr;
+
+static PFN_D3D12CreateRootSignatureDeserializer
+    g_D3D12CreateRootSignatureDeserializer = nullptr;
+
+static PFN_D3D12CreateVersionedRootSignatureDeserializer
+    g_D3D12CreateVersionedRootSignatureDeserializer = nullptr;
+
+static PFN_D3D12SerializeRootSignature
+    g_D3D12SerializeRootSignature = nullptr;
+
+static PFN_D3D12SerializeVersionedRootSignature
+    g_D3D12SerializeVersionedRootSignature = nullptr;
+
+static std::once_flag g_init;
+
+static void Log(const char* fmt, ...)
+{
+    char exePath[MAX_PATH]{};
+
+    if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH))
+        return;
+
+    char* slash = strrchr(exePath, '\\');
+
+    if (slash)
+        *slash = '\0';
+
+    char logPath[MAX_PATH]{};
+
+    wsprintfA(
+        logPath,
+        "%s\\Resonance_RX580_CustomFix.log",
+        exePath
+    );
+
+    FILE* file = nullptr;
+
+    fopen_s(&file, logPath, "a");
+
+    if (!file)
+        return;
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    fprintf(
+        file,
+        "[%02u:%02u:%02u.%03u] ",
+        st.wHour,
+        st.wMinute,
+        st.wSecond,
+        st.wMilliseconds
+    );
+
+    va_list args;
+    va_start(args, fmt);
+
+    vfprintf(file, fmt, args);
+
+    va_end(args);
+
+    fprintf(file, "\n");
+
+    fclose(file);
+}
+
+static FARPROC GetRealProc(const char* name)
+{
+    if (!g_realD3D12)
+        return nullptr;
+
+    return GetProcAddress(g_realD3D12, name);
+}
+
+static void InitRealD3D12()
+{
+    char systemDir[MAX_PATH]{};
+
+    UINT len = GetSystemDirectoryA(
+        systemDir,
+        MAX_PATH
+    );
+
+    if (len == 0 || len >= MAX_PATH)
+    {
+        Log("ERROR: GetSystemDirectoryA failed");
+        return;
+    }
+
+    char path[MAX_PATH]{};
+
+    wsprintfA(
+        path,
+        "%s\\d3d12.dll",
+        systemDir
+    );
+
+    g_realD3D12 = LoadLibraryA(path);
+
+    if (!g_realD3D12)
+    {
+        Log(
+            "ERROR: cannot load system d3d12.dll, error=%lu",
+            GetLastError()
+        );
+
+        return;
+    }
+
+    g_D3D12CreateDevice =
+        reinterpret_cast<PFN_D3D12CreateDevice>(
+            GetRealProc("D3D12CreateDevice")
+        );
+
+    g_D3D12GetDebugInterface =
+        reinterpret_cast<PFN_D3D12GetDebugInterface>(
+            GetRealProc("D3D12GetDebugInterface")
+        );
+
+    g_D3D12GetInterface =
+        reinterpret_cast<PFN_D3D12GetInterface>(
+            GetRealProc("D3D12GetInterface")
+        );
+
+    g_D3D12CreateRootSignatureDeserializer =
+        reinterpret_cast<PFN_D3D12CreateRootSignatureDeserializer>(
+            GetRealProc(
+                "D3D12CreateRootSignatureDeserializer"
+            )
+        );
+
+    g_D3D12CreateVersionedRootSignatureDeserializer =
+        reinterpret_cast<
+            PFN_D3D12CreateVersionedRootSignatureDeserializer
+        >(
+            GetRealProc(
+                "D3D12CreateVersionedRootSignatureDeserializer"
+            )
+        );
+
+    g_D3D12SerializeRootSignature =
+        reinterpret_cast<PFN_D3D12SerializeRootSignature>(
+            GetRealProc("D3D12SerializeRootSignature")
+        );
+
+    g_D3D12SerializeVersionedRootSignature =
+        reinterpret_cast<
+            PFN_D3D12SerializeVersionedRootSignature
+        >(
+            GetRealProc(
+                "D3D12SerializeVersionedRootSignature"
+            )
+        );
+
+    Log("=== Custom RX580 D3D12 Proxy loaded ===");
+    Log("System DLL: %s", path);
+
+    Log(
+        "D3D12CreateDevice = %p",
+        reinterpret_cast<void*>(g_D3D12CreateDevice)
+    );
+
+    Log(
+        "D3D12GetInterface = %p",
+        reinterpret_cast<void*>(g_D3D12GetInterface)
+    );
+}
+
+static bool EnsureLoaded()
+{
+    std::call_once(
+        g_init,
+        InitRealD3D12
+    );
+
+    return g_D3D12CreateDevice != nullptr;
+}
+
+
+// ============================================================
+// D3D12CreateDevice
+// ============================================================
+
+extern "C" __declspec(dllexport)
+HRESULT WINAPI D3D12CreateDevice(
+    IUnknown* pAdapter,
+    D3D_FEATURE_LEVEL MinimumFeatureLevel,
+    REFIID riid,
+    void** ppDevice)
+{
+    if (!EnsureLoaded())
+        return E_FAIL;
+
+    Log(
+        "D3D12CreateDevice requested FL=0x%X",
+        static_cast<unsigned>(MinimumFeatureLevel)
+    );
+
+    /*
+        RX 580 الحقيقي عندك يظهر Feature Level 12_0.
+
+        لا نجبر التعريف على 12_1 هنا.
+        نسمح للـdriver الحقيقي بإنشاء الجهاز على 12_0.
+    */
+
+    D3D_FEATURE_LEVEL actualLevel =
+        MinimumFeatureLevel;
+
+    if (actualLevel > D3D_FEATURE_LEVEL_12_0)
+        actualLevel = D3D_FEATURE_LEVEL_12_0;
+
+    HRESULT hr =
+        g_D3D12CreateDevice(
+            pAdapter,
+            actualLevel,
+            riid,
+            ppDevice
+        );
+
+    Log(
+        "D3D12CreateDevice actual FL=0x%X HRESULT=0x%08X",
+        static_cast<unsigned>(actualLevel),
+        static_cast<unsigned>(hr)
+    );
+
+    return hr;
+}
+
+
+// ============================================================
+// D3D12GetDebugInterface
+// ============================================================
+
+extern "C" __declspec(dllexport)
+HRESULT WINAPI D3D12GetDebugInterface(
+    REFIID riid,
+    void** ppvDebug)
+{
+    if (!EnsureLoaded())
+        return E_FAIL;
+
+    if (!g_D3D12GetDebugInterface)
+        return E_NOINTERFACE;
+
+    return g_D3D12GetDebugInterface(
+        riid,
+        ppvDebug
+    );
+}
+
+
+// ============================================================
+// D3D12GetInterface
+// ============================================================
+
+extern "C" __declspec(dllexport)
+HRESULT WINAPI D3D12GetInterface(
+    REFCLSID rclsid,
+    REFIID riid,
+    void** ppv)
+{
+    if (!EnsureLoaded())
+        return E_FAIL;
+
+    if (!g_D3D12GetInterface)
+        return E_NOINTERFACE;
+
+    return g_D3D12GetInterface(
+        rclsid,
+        riid,
+        ppv
+    );
+}
+
+
+// ============================================================
+// D3D12CreateRootSignatureDeserializer
+// ============================================================
+
+extern "C" __declspec(dllexport)
+HRESULT WINAPI D3D12CreateRootSignatureDeserializer(
+    LPCVOID pSrcData,
+    SIZE_T SrcDataSizeInBytes,
+    REFIID pRootSignatureDeserializerInterface,
+    void** ppvDeserializer)
+{
+    if (!EnsureLoaded())
+        return E_FAIL;
+
+    if (!g_D3D12CreateRootSignatureDeserializer)
+        return E_NOINTERFACE;
+
+    return g_D3D12CreateRootSignatureDeserializer(
+        pSrcData,
+        SrcDataSizeInBytes,
+        pRootSignatureDeserializerInterface,
+        ppvDeserializer
+    );
+}
+
+
+// ============================================================
+// D3D12CreateVersionedRootSignatureDeserializer
+// ============================================================
+
+extern "C" __declspec(dllexport)
+HRESULT WINAPI D3D12CreateVersionedRootSignatureDeserializer(
+    LPCVOID pSrcData,
+    SIZE_T SrcDataSizeInBytes,
+    REFIID pVersionedRootSignatureDeserializerInterface,
+    void** ppvDeserializer)
+{
+    if (!EnsureLoaded())
+        return E_FAIL;
+
+    if (!g_D3D12CreateVersionedRootSignatureDeserializer)
+        return E_NOINTERFACE;
+
+    return g_D3D12CreateVersionedRootSignatureDeserializer(
+        pSrcData,
+        SrcDataSizeInBytes,
+        pVersionedRootSignatureDeserializerInterface,
+        ppvDeserializer
+    );
+}
+
+
+// ============================================================
+// D3D12SerializeRootSignature
+// ============================================================
+
+extern "C" __declspec(dllexport)
+HRESULT WINAPI D3D12SerializeRootSignature(
+    const D3D12_ROOT_SIGNATURE_DESC* pRootSignature,
+    D3D_ROOT_SIGNATURE_VERSION Version,
+    ID3DBlob** ppBlob,
+    ID3DBlob** ppErrorBlob)
+{
+    if (!EnsureLoaded())
+        return E_FAIL;
+
+    if (!g_D3D12SerializeRootSignature)
+        return E_NOINTERFACE;
+
+    return g_D3D12SerializeRootSignature(
+        pRootSignature,
+        Version,
+        ppBlob,
+        ppErrorBlob
+    );
+}
+
+
+// ============================================================
+// D3D12SerializeVersionedRootSignature
+// ============================================================
+
+extern "C" __declspec(dllexport)
+HRESULT WINAPI D3D12SerializeVersionedRootSignature(
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* pRootSignature,
+    ID3DBlob** ppBlob,
+    ID3DBlob** ppErrorBlob)
+{
+    if (!EnsureLoaded())
+        return E_FAIL;
+
+    if (!g_D3D12SerializeVersionedRootSignature)
+        return E_NOINTERFACE;
+
+    return g_D3D12SerializeVersionedRootSignature(
+        pRootSignature,
+        ppBlob,
+        ppErrorBlob
+    );
+}
+
+
+// ============================================================
+// DllMain
+// ============================================================
+
+BOOL WINAPI DllMain(
+    HINSTANCE hinstDLL,
+    DWORD fdwReason,
+    LPVOID)
+{
+    if (fdwReason == DLL_PROCESS_ATTACH)
+    {
+        DisableThreadLibraryCalls(hinstDLL);
+    }
+
+    return TRUE;
+}

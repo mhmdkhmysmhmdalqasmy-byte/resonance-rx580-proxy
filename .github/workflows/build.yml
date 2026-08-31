@@ -1,0 +1,49 @@
+name: Build RX580 D3D12 Proxy
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build DLL
+        shell: cmd
+        run: |
+          cl /nologo /O2 /LD /EHsc /std:c++17 ^
+             /DWIN32_LEAN_AND_MEAN ^
+             /DUNICODE /D_UNICODE ^
+             src\main.cpp ^
+             /link ^
+             /OUT:d3d12.dll ^
+             d3d12.lib dxgi.lib
+
+      - name: Verify DLL
+        shell: powershell
+        run: |
+          if (-not (Test-Path "d3d12.dll")) {
+            Write-Error "d3d12.dll was not created"
+            exit 1
+          }
+
+          Get-Item d3d12.dll |
+            Select-Object Name,Length,LastWriteTime
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: resonance-rx580-d3d12
+          path: d3d12.dll
+          
